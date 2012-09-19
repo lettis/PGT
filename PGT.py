@@ -264,6 +264,12 @@ def angularDistance( R ):
     return 0.0
 
 
+def angleBetweenVectors( v1, v2 ):
+  normV1 = scipy.dot(v1,v1)
+  normV2 = scipy.dot(v2,v2)
+  return scipy.arccos( scipy.dot(v1,v2) / normV1 / normV2 )
+
+
 def rotFits( M, ref=None ):
   """
   read matrix M with cartesian 3D coordinates of N particles of form
