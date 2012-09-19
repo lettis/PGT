@@ -5,7 +5,7 @@ This is a toolbox written in Python to ease the work with GROMACS.
 It is documented via the docstring-feature of Python.
 
 This toolkit is currently very much a work in progress and
-not to be considered being an end-product of some kind.
+not to be considered being an end-product of any kind.
 Publication is done in hope to inspire / ease someone else's work or to
 help him/her not having to reinvent the wheel.
 
@@ -47,7 +47,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 The views and conclusions contained in the software and documentation are those
 of the authors and should not be interpreted as representing official policies,
 
-either expressed or implied, of the PGT Project.
+either expressed or implied, of the PGT project.
 
 
 Prerequesites
