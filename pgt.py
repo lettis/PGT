@@ -764,12 +764,12 @@ class Structure:
 
   def radiusOfGyration(self):
     """calculate radius of gyration of structure"""
-
-    totalMass = self.totalMass()
-
-    #TODO: finish radius of gyration calculation (reference: zim -> bmd -> statistics)
-
-
+    Rg = 0
+    com = self.centerOfMass()
+    for atom in self.atoms:
+      diff = scipy.array(atom.r) - com
+      Rg += scipy.dot(diff, diff) * atomMasses[atom.atom]
+    return scipy.sqrt( Rg/self.totalMass() )
 
   def __str__(self):
     """prints structure in simple 'x1 y1 z1 x2 y2 z2 ...' representation"""
