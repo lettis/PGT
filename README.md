@@ -57,5 +57,5 @@ Prerequesites
     * SciPy / Numpy
     * pexpect (Python expect module)
     * matplotlib
-
+    * python-sphinx (autodoc tool)
 
