@@ -211,7 +211,6 @@ def linewise( fh, func, ref ):
     fh.close()
 
 
-#TODO: write INFO for blob dumping/loading
 def blobDump( obj, filename ):
   """write serialized version of object to file"""
   fh = open( filename, "wb" )
@@ -761,7 +760,7 @@ class Structure:
     com = scipy.zeros(3)
     for atom in self.atoms:
       com += scipy.array(atom.r) * atomMasses[atom.atom]
-    return com / self.totalMass
+    return com / self.totalMass()
 
   def radiusOfGyration(self):
     """calculate radius of gyration of structure"""
@@ -778,6 +777,11 @@ class Structure:
     for atom in self.atoms:
       buf.extend( [atom.r[0], atom.r[1], atom.r[2]] )
     return " ".join( buf )
+
+  def translate(self, d):
+    """translate structure in given direction"""
+    for i in range( len(self.atoms) ):
+      self.atoms[i].r += d
     
 
 class Trajectory:
@@ -801,6 +805,11 @@ class Trajectory:
                             filter( lambda i,s: i in ids,  enumerate(self.structures) )
     )
 
+  def translateCOM(self):
+    """translate structures to set center of mass to origin"""
+    s = self.structures
+    for i in range( len(s) ):
+      s[i].translate( (-1)* s[i].centerOfMass() )
 
   def extractCoords(self):
     """extract coords from structures and return them as numpy-matrix
