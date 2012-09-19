@@ -8,8 +8,9 @@ from glob import glob
 
 try:
   import numpy
+  import scipy
 except:
-  print "error: numpy not found. cannot do without it. sorry."
+  print "error: numpy/scipy not found. cannot do without it. sorry."
   sys.exit()
 
 try:
@@ -970,9 +971,8 @@ class IndexFile:
 
 class GroFile:
   """represents GROMACS .gro trajectory files"""
-  def __init__(self, filename=None):
-    # TODO: move 'filename' to params
-    self.groFile = filename
+  def __init__(self, params):
+    self.groFile = params["input"]
     self.log = logging.getLogger( " GroFile " )
 
   def readCoords(self, ids=None):
@@ -1020,8 +1020,7 @@ class GroFile:
 
   def read(self):
     """read .gro-file and return Trajectory object"""
-    # TODO: currently ignores last line of a data-set.
-    #       what is the meaning of this line?
+    # TODO: currently ignores box vectors
     traj = Trajectory()
     #TODO: change to make use of 'linewise()'
     fh = open( self.groFile, "r" )
@@ -1038,8 +1037,8 @@ class GroFile:
               # append atom to structure
               traj.structures[-1].atoms.append(
                 Atom( atom    = line[1],
-                      r       = map( float, [line[3], line[4], line[5]] ),
-                      v       = map( float, [line[6], line[7], line[8]] ),
+                      r       = scipy.array( map(float, [line[3], line[4], line[5]]) ),
+                      v       = scipy.array( map(float, [line[6], line[7], line[8]]) ),
                       residue = line[0]
                 )
               )
