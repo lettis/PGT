@@ -265,8 +265,8 @@ def angularDistance( R ):
 
 
 def angleBetweenVectors( v1, v2 ):
-  normV1 = scipy.dot(v1,v1)
-  normV2 = scipy.dot(v2,v2)
+  normV1 = scipy.sqrt( scipy.dot(v1,v1) )
+  normV2 = scipy.sqrt( scipy.dot(v2,v2) )
   return scipy.arccos( scipy.dot(v1,v2) / normV1 / normV2 )
 
 
@@ -782,7 +782,7 @@ class Structure:
     buf = []
     for atom in self.atoms:
       buf.extend( [atom.r[0], atom.r[1], atom.r[2]] )
-    return " ".join( buf )
+    return " ".join( map(str,buf) )
 
   def translate(self, d):
     """translate structure in given direction"""
@@ -1033,36 +1033,74 @@ class GroFile:
     self.log.info( " ... finished." )
     return numpy.matrix(m)
 
-  def read(self):
-    """read .gro-file and return Trajectory object"""
-    # TODO: currently ignores box vectors
-    # TODO: currently ignores t / dt
-    traj = Trajectory()
-    #TODO: change to make use of 'linewise()'
+  def framewise(self, func, nFrames=None):
+    """
+    read file framewise, generate structure from frame and apply 'func( struct )'.
+    abort after nFrames (default: None = read all).
+    """
+    frameCounter = 0
     fh = open( self.params["input"], "r" )
     try:
       while 1:
         try:
           line = fh.next()
           if 'Generated' in line:
+            frameCounter += 1
             nAtoms = int( fh.next().strip() )
-            # append next structure to trajectory
-            traj.structures.append( Structure() )
+            struct = Structure()
             for i in range(nAtoms):
               line = fh.next().strip().split()
               # append atom to structure
-              traj.structures[-1].atoms.append(
+              struct.atoms.append(
                 Atom( atom    = line[1],
                       r       = scipy.array( map(float, [line[3], line[4], line[5]]) ),
                       v       = scipy.array( map(float, [line[6], line[7], line[8]]) ),
                       residue = line[0]
                 )
               )
+            # apply given function
+            func( struct )
+            if nFrames and (frameCounter >= nFrames):
+              break # got enough frames: abort
         except StopIteration:
           break # exit the while-loop
     finally:
       fh.close()
+
+  def read(self):
+    traj = Trajectory()
+    self.framewise( traj.structures.append )
     return traj
+
+#  def read(self):
+#    """read .gro-file and return Trajectory object"""
+#    # TODO: currently ignores box vectors
+#    # TODO: currently ignores t / dt
+#    traj = Trajectory()
+#    fh = open( self.params["input"], "r" )
+#    try:
+#      while 1:
+#        try:
+#          line = fh.next()
+#          if 'Generated' in line:
+#            nAtoms = int( fh.next().strip() )
+#            # append next structure to trajectory
+#            traj.structures.append( Structure() )
+#            for i in range(nAtoms):
+#              line = fh.next().strip().split()
+#              # append atom to structure
+#              traj.structures[-1].atoms.append(
+#                Atom( atom    = line[1],
+#                      r       = scipy.array( map(float, [line[3], line[4], line[5]]) ),
+#                      v       = scipy.array( map(float, [line[6], line[7], line[8]]) ),
+#                      residue = line[0]
+#                )
+#              )
+#        except StopIteration:
+#          break # exit the while-loop
+#    finally:
+#      fh.close()
+#    return traj
 
   def write(self, traj, mode="w"):
     """
@@ -1145,7 +1183,8 @@ class PCA:
       else:
         # compute PCA (if input file is given)
         if "PATH" in self.params.keys():
-          m = GroFile( self.params["PATH"] + "/" + self.params["input"] ).readCoords()
+          #m = GroFile( self.params["PATH"] + "/" + self.params["input"] ).readCoords()
+          m = GroFile( self.params ).readCoords()
           self.run( m )
           del m
 
