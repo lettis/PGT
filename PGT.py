@@ -184,6 +184,58 @@ def splitList( a, nElems ):
   return lists
 
 
+def smoothen( xs, ys, width=100 ):
+  """
+  smoothen the given data (x- and y-values; given as lists) by
+  generating new lists with the averages over #'width' datapoints
+  """
+  newXs = []
+  newYs = []
+  for i in range(width, len(xs) ):
+    newXs.append( sum(xs[ i-width:i ]) / width )
+    newYs.append( sum(ys[ i-width:i ]) / width )
+  return (newXs, newYs)
+
+
+
+def generateThetas( key, indexN, refIndex=1 ):
+  """
+  generate thetas [rad] between structures of a .gro-file and a reference
+  defined by 'refIndex' (per default =1, i.e. the first structure in the file).
+  thetas are taken as angle between vectors N->CA of both structures.
+  """
+  params = PGT.Params()
+  params["input"] = key
+  # dummy class for closure
+  class Reference:
+    def __init__(self):
+      struct = None
+    def get(self, struct):
+      self.struct = struct
+  # get reference (first frame in .gro file)
+  ref = Reference()
+  PGT.GroFile( params ).framewise( ref.get, nFrames=refIndex )
+  # take vector N->CA (array index reduced from base1 to base0)
+  refVec = ref.struct.atoms[indexN].r - ref.struct.atoms[indexN-1].r
+  # list of rot angles between structures
+  class Thetas:
+    def __init__(self, refVec):
+      self.refVec = refVec
+      self.thetas = []
+    def appendTheta(self, struct):
+      v = struct.atoms[indexN].r - struct.atoms[indexN-1].r
+      self.thetas.append( PGT.angleBetweenVectors(self.refVec, v) )
+  thetas = Thetas( refVec )
+  # calculate angles framewise
+  PGT.GroFile(params).framewise( thetas.appendTheta )
+  return thetas.thetas
+
+
+
+
+
+
+
 def linewise( fh, func, ref ):
   """
   parse file linewise and perform 'func' on every line
@@ -578,21 +630,29 @@ class Dihedrals:
       - nGroup:    number of phi/psi pair to be used (starting with 1)
     """
     transp = self.dihedrals.transpose()
-    phi = numpy.array( transp[ (nGroup-1)*2    ] ).flatten()
+    phi = numpy.array( transp[ (nGroup-1)*2    ] ).flatten() # -1, since first group (group 1) is at index 0
     psi = numpy.array( transp[ (nGroup-1)*2 +1 ] ).flatten()
 
-    plt.figure()
-    ax = plt.subplot( 211 )
+    def replot( first=True ):
+      plt.figure()
+      if first:
+        ax = plt.subplot( 111 )
+      else:
+        ax = plt.subplot( 211 )
 
-    h, xedges, yedges = numpy.histogram2d( phi, psi, bins=bins )
-    extent = [xedges[0], xedges[-1], yedges[0], yedges[-1] ]
-    plt.imshow(h.T,extent=extent,interpolation='nearest',origin='lower',aspect='auto')
-    plt.colorbar()
-    plt.xlabel( "phi%i" % nGroup )
-    plt.ylabel( "psi%i" % nGroup )
-    self.redonePlotsRama = 0
+      h, xedges, yedges = numpy.histogram2d( phi, psi, bins=bins )
+      extent = [xedges[0], xedges[-1], yedges[0], yedges[-1] ]
+      plt.imshow(h.T,extent=extent,interpolation='nearest',origin='lower',aspect='auto')
+      plt.colorbar()
+      plt.xlabel( "$\\phi_{%i}$ [deg]" % (nGroup+1) ) # +1, since first group is actually phi/psi 2
+      plt.ylabel( "$\\psi_{%i}$ [deg]" % (nGroup+1) )
+      return ax
+
+    ax = replot()
+
+    #self.redonePlotsRama = 0
     def onselect(pos1, pos2):
-      ax = plt.subplot( 212 )
+      #ax = plt.subplot( 212 )
       fontP = FontProperties()
       fontP.set_size('x-small')
       self.params.setDefault( "plot_dihedrals", [nGroup] )
@@ -601,6 +661,20 @@ class Dihedrals:
       xMax = pos2.xdata
       yMin = pos1.ydata
       yMax = pos2.ydata
+
+      ax = replot( first=False )
+      ax.add_patch( plt.Rectangle(
+                      (xMin,yMin),
+                       xMax-xMin,
+                       yMax-yMin,
+                       fill=False,
+                       color='red',
+                       linewidth=2.0
+                    )
+      )
+
+      plt.subplot( 212 )
+
       # order values
       xMin, xMax = minMax( xMin, xMax )
       yMin, yMax = minMax( yMin, yMax )
@@ -615,12 +689,15 @@ class Dihedrals:
       dihData = self.filteredDihData( selectedIds )
       xRange = binning( -180, 180, bins )
       for dihIndex in self.params["plot_dihedrals"]:
-        self.redonePlotsRama += 1
+        #self.redonePlotsRama += 1
         h, _ = numpy.histogram( dihData["phi"][dihIndex], bins=bins, range=(-180,180) )
-        plt.plot( xRange, h.T, label="phi%i__%i" % (dihIndex, self.redonePlotsRama) )
+        plt.plot( xRange, h.T, label="phi%i" % (dihIndex+1) ) # +1, because first group is actually residue 2
         h, _ = numpy.histogram( dihData["psi"][dihIndex], bins=bins, range=(-180,180) )
-        plt.plot( xRange, h.T, label="psi%i__%i" % (dihIndex, self.redonePlotsRama) )
+        plt.plot( xRange, h.T, label="psi%i" % (dihIndex+1) )
         plt.legend(bbox_to_anchor=(1.02, 1), loc=2, borderaxespad=0., prop=fontP)
+
+      plt.ylabel( "population" )
+      plt.xlabel( "[deg]" )
 
     span = matplotlib.widgets.RectangleSelector( ax, onselect )
 
@@ -734,6 +811,9 @@ class InternalCoordinates:
       self.angles.append( anglesCurStruct )
       self.dihedrals.append( dihedralsCurStruct )
       
+  def toCartesians(self):
+    #TODO: implement internal -> cartesian trafo
+    pass
 
 
 class Structure:
@@ -1038,6 +1118,8 @@ class GroFile:
     read file framewise, generate structure from frame and apply 'func( struct )'.
     abort after nFrames (default: None = read all).
     """
+    # TODO: currently ignores box vectors
+    # TODO: currently ignores t / dt
     frameCounter = 0
     fh = open( self.params["input"], "r" )
     try:
@@ -1071,36 +1153,6 @@ class GroFile:
     traj = Trajectory()
     self.framewise( traj.structures.append )
     return traj
-
-#  def read(self):
-#    """read .gro-file and return Trajectory object"""
-#    # TODO: currently ignores box vectors
-#    # TODO: currently ignores t / dt
-#    traj = Trajectory()
-#    fh = open( self.params["input"], "r" )
-#    try:
-#      while 1:
-#        try:
-#          line = fh.next()
-#          if 'Generated' in line:
-#            nAtoms = int( fh.next().strip() )
-#            # append next structure to trajectory
-#            traj.structures.append( Structure() )
-#            for i in range(nAtoms):
-#              line = fh.next().strip().split()
-#              # append atom to structure
-#              traj.structures[-1].atoms.append(
-#                Atom( atom    = line[1],
-#                      r       = scipy.array( map(float, [line[3], line[4], line[5]]) ),
-#                      v       = scipy.array( map(float, [line[6], line[7], line[8]]) ),
-#                      residue = line[0]
-#                )
-#              )
-#        except StopIteration:
-#          break # exit the while-loop
-#    finally:
-#      fh.close()
-#    return traj
 
   def write(self, traj, mode="w"):
     """
@@ -1211,9 +1263,7 @@ class PCA:
     #  v = (conjugate transpose) matrix of right eigenvectors
     _ ,s,v = numpy.linalg.svd( c )
     del c
-
     v = v.transpose()
-
     self.projection = m*v
     self.eigenvals = s
     self.eigenvecs = v
@@ -1302,7 +1352,7 @@ class PCA:
     span = matplotlib.widgets.SpanSelector( ax, onselect )
 
 
-  def plot2DHist(self, pcX, pcY, bins=200, prep=None):
+  def plot2DHist(self, pcX, pcY, bins=200, prep=None, mode='population'):
     """
     plot 2d-histogram of projections of one PC over the other
 
@@ -1314,12 +1364,13 @@ class PCA:
       - prep:     if set, diagram will be saved to a file
                   called [prep]_[pcX]_[pcY].eps.
                   if not set, diagram will show up interactively.
+      - mode:     either 'population' or 'fel' (for "free energy landscape")
 
     **parameters**
 
       - plot_dihedrals:  (DEFAULT: []) if set, only plot given dihedral pair
                          in histogram. (e.g.: [1,3,4] for PhiPsi1, PhiPsi3, PhiPsi4).
-   """
+    """
     transp = self.projection.transpose()
     pc1 = numpy.array( transp[pcX] ).flatten()
     pc2 = numpy.array( transp[pcY] ).flatten()
@@ -1332,13 +1383,20 @@ class PCA:
         ax = plt.subplot(211)
 
       hist, xedges, yedges = numpy.histogram2d(pc1, pc2, bins=bins)
+      if mode == 'fel':
+        # compute free energy landscape by taking ln of population
+        hist = scipy.array(  map(lambda x: scipy.log(x), hist)  )
       extent = [xedges[0], xedges[-1], yedges[0], yedges[-1]]
       plt.imshow(hist.T, extent=extent, interpolation='nearest', origin='lower', aspect='auto')
       plt.colorbar()
       plt.xlabel( str(pcX+1) + ". PC" )
       plt.ylabel( str(pcY+1) + ". PC" )
-      plt.title( "combined population of %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
-
+      if mode == 'population':
+        plt.title( "combined population of %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
+      elif mode == 'fel':
+        plt.title( "free energy landscape along %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
+      else:
+        raise "UnknownMode"
       self.redonePlots2D = 0
       self.axSubplot = None
       return ax
@@ -1388,7 +1446,7 @@ class PCA:
         #plt.plot( xRange, h.T, label="phi%i__%i" % (dihIndex, self.redonePlots2D) )
         plt.plot( xRange,
                   h.T,
-                  label="phi%i" % (dihIndex),
+                  label="phi%i" % (dihIndex+1), # +1, since phi / psi 2 is actually first group to plot
                   color=plt.get_cmap(colormap)( float(2*i)/(2*(len(self.params["plot_dihedrals"]))) )
         )
 
@@ -1396,7 +1454,7 @@ class PCA:
         #plt.plot( xRange, h.T, label="psi%i__%i" % (dihIndex, self.redonePlots2D) )
         plt.plot( xRange,
                   h.T,
-                  label="psi%i" % (dihIndex),
+                  label="psi%i" % (dihIndex+1),
                   color=plt.get_cmap(colormap)( float(2*i+1)/(2*(len(self.params["plot_dihedrals"]))) )
         )
         plt.legend(bbox_to_anchor=(1.02, 1), loc=2, borderaxespad=0., prop=fontP)
@@ -1416,6 +1474,6 @@ class PCA:
     plt.plot( range(len(acc)), acc, marker='o' )
     plt.xticks( range(len(acc)) )
     plt.xlabel( "index of PC" )
-    plt.ylabel( "eigenval of PC" )
+    plt.ylabel( "acc. percentage" )
     plt.title( "accumulated percentage of variation of PCs" )
 
