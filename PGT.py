@@ -4,6 +4,7 @@ import sys
 import tempfile
 import logging
 import cPickle
+import copy
 from glob import glob
 
 try:
@@ -34,7 +35,7 @@ logging.basicConfig( level=logging.INFO )
 #################
 # definitions
 
-# atomic masses [u]; from GROMACS 'atommass.dat'
+#  atomic masses [u]; from GROMACS 'atommass.dat'
 # additional values introduced (marked by comment)
 atomMasses = {
  "H"   :    1.00790,
@@ -198,42 +199,30 @@ def smoothen( xs, ys, width=100 ):
 
 
 
-def generateThetas( key, indexN, refIndex=1 ):
+def generateThetas( params, indexN, indexCA, indexNref, indexCAref ):
   """
   generate thetas [rad] between structures of a .gro-file and a reference
   defined by 'refIndex' (per default =1, i.e. the first structure in the file).
   thetas are taken as angle between vectors N->CA of both structures.
   """
-  params = PGT.Params()
-  params["input"] = key
-  # dummy class for closure
-  class Reference:
-    def __init__(self):
-      struct = None
-    def get(self, struct):
-      self.struct = struct
-  # get reference (first frame in .gro file)
-  ref = Reference()
-  PGT.GroFile( params ).framewise( ref.get, nFrames=refIndex )
+  # read reference structure
+  paramsRef = Params()
+  paramsRef["input"] = params["reference"]
+  ref = GroFile( paramsRef ).read().structures[0]
   # take vector N->CA (array index reduced from base1 to base0)
-  refVec = ref.struct.atoms[indexN].r - ref.struct.atoms[indexN-1].r
+  refVec = ref.atoms[indexCAref-1].r - ref.atoms[indexNref-1].r
   # list of rot angles between structures
   class Thetas:
     def __init__(self, refVec):
       self.refVec = refVec
       self.thetas = []
     def appendTheta(self, struct):
-      v = struct.atoms[indexN].r - struct.atoms[indexN-1].r
-      self.thetas.append( PGT.angleBetweenVectors(self.refVec, v) )
+      v = struct.atoms[indexCA-1].r - struct.atoms[indexN-1].r
+      self.thetas.append( angleBetweenVectors(self.refVec, v) )
   thetas = Thetas( refVec )
   # calculate angles framewise
-  PGT.GroFile(params).framewise( thetas.appendTheta )
+  GroFile(params).framewise( thetas.appendTheta )
   return thetas.thetas
-
-
-
-
-
 
 
 def linewise( fh, func, ref ):
@@ -271,12 +260,22 @@ def blobDump( obj, filename ):
   log = logging.getLogger( " blobDump " )
   log.info( "dumping '%s'-object to %s" % (obj.__class__.__name__, filename) )
 
-def blobLoad( filename ):
+def blobLoad( filename, generator=None ):
   """load object from file and return it"""
-  fh = open( filename, "rb" )
+  log = logging.getLogger( " blobLoad " )
+
+  try:
+    fh = open( filename, "rb" )
+  except IOError:
+    if generator:
+      log.info( "file not found: %s; will create object via generator function." % filename )
+      obj = generator()
+      blobDump( obj, filename )
+      return obj
+    else:
+      raise
   obj = cPickle.load( fh )
   fh.close()
-  log = logging.getLogger( " blobLoad " )
   log.info( "loading '%s'-object from %s" % (obj.__class__.__name__, filename) )
   return obj
 
@@ -319,9 +318,10 @@ def angularDistance( R ):
 def angleBetweenVectors( v1, v2 ):
   normV1 = scipy.sqrt( scipy.dot(v1,v1) )
   normV2 = scipy.sqrt( scipy.dot(v2,v2) )
-  return scipy.arccos( scipy.dot(v1,v2) / normV1 / normV2 )
+  return scipy.arccos( scipy.absolute(scipy.dot(v1,v2)) / normV1 / normV2 )
 
 
+#TODO: implement MR
 def rotFits( M, ref=None ):
   """
   read matrix M with cartesian 3D coordinates of N particles of form
@@ -340,26 +340,7 @@ def rotFits( M, ref=None ):
   least squares fit to 3D structure is based on [Sorkine2003].
   """
   nRows, nCols = M.shape
-  # split ref-structure into list of 3D-vectors
-  vs_ref = []
-  for i in range(nCols / 3):
-    if not ref:
-      x,y,z = M.item(0,3*i), M.item(0,3*i+1), M.item(0,3*i+2)
-    else:
-      x,y,z = ref.item(0,3*i), ref.item(0,3*i+1), ref.item(0,3*i+2)
-    vs_ref.append( numpy.array([x,y,z]) )
-  # calculate centroid for ref-structure
-  centroidRef = numpy.zeros( 3 )
-  for vec in vs_ref:
-    centroidRef += vec
-  # translate to center (reference structure)
-  for i in range(len(vs_ref)):
-    vs_ref[i] -= centroidRef
-  # set up ref matrix for SVD fit
-  Y = numpy.matrix(vs_ref).transpose()
-  ## calculate rotation matrices
-  M_fit = []
-  for r in range(nRows):
+  def extractVs( M, r ):
     # split structure (i.e. current row) into list of 3D vectors
     vs = []
     for i in range(nCols / 3):
@@ -371,6 +352,18 @@ def rotFits( M, ref=None ):
       centroidStruct += vs[i]
     for i in range(len(vs)):
       vs[i] -= centroidStruct
+    return vs
+
+  # split ref-structure into list of 3D-vectors
+  vs_ref = extractVs( M, 0 )
+
+  # set up ref matrix for SVD fit
+  Y = numpy.matrix(vs_ref).transpose()
+
+  ## calculate rotation matrices
+  M_fit = []
+  for r in range(nRows):
+    vs = extractVs( M, r )
     # set up matrix for SVD
     X = numpy.matrix(vs).transpose()
     # calculate 'variance' matrix for SVD
@@ -421,7 +414,16 @@ class Params(dict):
       self.log.info( " dihedrals already available from: " + dihBlobs[0] )
       if len(dihBlobs) > 1:
         self.log.warning( " only preloading of one dihedral BLOB supported right now" )
-    
+    # search for RGyr blobs
+    self["RGYR_BLOBS"] = glob( path + "/*_rgyr.blob" )
+    if self["RGYR_BLOBS"] != []:
+      for filename in self["RGYR_BLOBS"]:
+        self.log.info( " R_gyr already available from: " + filename )
+    # search for RMSD blobs
+    self["RMSD_BLOBS"] = glob( path + "/*_rmsd.blob" )
+    if self["RMSD_BLOBS"] != []:
+      for filename in self["RMSD_BLOBS"]:
+        self.log.info( " RMSD values already available from: " + filename )
 
 
 ###################
@@ -459,6 +461,7 @@ class Atom:
     - residue:    the residue an atom is assigned to
   """
   def __init__(self, atom, r, v=None, residue=None):
+    #TODO: self.atom -> self.name
     self.atom    = atom
     self.r       = r
     self.v       = v
@@ -589,8 +592,15 @@ class Dihedrals:
       raise "unknown angle: " + dih
     transp = self.dihedrals.transpose()
     dihDat = numpy.array( transp[2*nGroup + offset] ).flatten()
-    plt.hist( x=dihDat, bins=bins, histtype='step' )
-    #TODO: implement write to file
+
+    h, _ = numpy.histogram( dihDat, bins=bins, range=(-180,180) )
+    xRange = binning( -180, 180, bins )
+    plt.plot( xRange, h.T, label="%s%i" % (dih, nGroup+1) ) # +1, because first group is actually residue 2
+    fontP = FontProperties()
+    fontP.set_size('x-small')
+    plt.legend(bbox_to_anchor=(1.02, 1), loc=2, borderaxespad=0., prop=fontP)
+    plt.ylabel( "population" )
+    plt.xlabel( "[deg]" )
 
 
   def filteredDihData(self, selectedIds):
@@ -766,7 +776,7 @@ class InternalCoordinates:
     self.dihedrals = []
 
   def fromCartesians(self, cartCoords=None):
-    if cartCoords:
+    if not cartCoords == None:
       cCoords = cartCoords
     elif 'input' in self.params:
       cCoords = GroFile( self.params ).readCoords()
@@ -774,11 +784,12 @@ class InternalCoordinates:
       raise Exception( 
         "unable to convert cartesian coordinates to internals: no cartesians given and no input specified in 'params'"
       )
+    cCoords = scipy.array(cCoords)
     nRows, nAtoms = cCoords.shape
     # we assume 3D space, therefore the number of atoms is
     # 1/3 of cartesian coords (x1,y1,z1,x2,y2,z2,...xN,yN,zN)
     nAtoms /= 3
-    coordsN = lambda i: numpy.array( [cCoords[3*i], cCoords[3*i+1], cCoords[3*i+2]] )
+    coordsN = lambda n,i: numpy.array( [cCoords[n][3*i], cCoords[n][3*i+1], cCoords[n][3*i+2]] )
     self.bonds = []
     self.angles = []
     self.dihedrals = []
@@ -787,23 +798,23 @@ class InternalCoordinates:
       anglesCurStruct = []
       dihedralsCurStruct = []
       for i in range( nAtoms-1 ):
-        a = coordsN(i)
-        b = coordsN(i+1)
+        a = coordsN(n,i)
+        b = coordsN(n,i+1)
         # calculate bond lengths of consecutive atoms
         bondsCurStruct.append( numpy.sqrt(numpy.dot(a,b)) )
         if i < nAtoms-2:
           # calculate angles between atoms
-          c = coordsN(i+2)
+          c = coordsN(n,i+2)
           anglesCurStruct.append( numpy.math.acos(numpy.dot((a-b),(c-b))) )
         if i < nAtoms-3:
           # calculate dihedrals angles
-          d = coordsN(i+3)
+          d = coordsN(n,i+3)
           b1 = b-a
           b2 = c-b
           b3 = d-c
           dihedralsCurStruct.append(
-            numpy.atan2(
-              numpy.math.sqrt(numpy.dot(b2,b2)) * b1 * numpy.cross(b2,b3),
+            numpy.math.atan2(
+              numpy.dot(numpy.math.sqrt(numpy.dot(b2,b2))*b1, numpy.cross(b2,b3)),
               numpy.dot(numpy.cross(b1,b2),numpy.cross(b2,b3))
             )
           )
@@ -864,6 +875,18 @@ class Structure:
       buf.extend( [atom.r[0], atom.r[1], atom.r[2]] )
     return " ".join( map(str,buf) )
 
+  def loadFromXYZ(self, xyzArray, ref):
+    """load structure from xyz-array (scipy-array);
+        ref is a Structure object which defines a reference for atom names and residues"""
+    xyzArray = xyzArray.flatten().tolist()
+    nAtoms = len(xyzArray) / 3
+    self.atoms = []
+    for i in range(nAtoms):
+      atom = copy.copy( ref.atoms[i] )
+      atom.r = [ xyzArray[3*i], xyzArray[3*i+1], xyzArray[3*i+2] ]
+      atom.v = scipy.zeros(3).tolist()
+      self.atoms.append( atom )
+
   def translate(self, d):
     """translate structure in given direction"""
     for i in range( len(self.atoms) ):
@@ -913,6 +936,189 @@ class Trajectory:
 ###############
 # binary interfaces
 
+class G_rms:
+  @staticmethod
+  def blobFilename( inputFilename ):
+    """
+    generate filename for a RMSD-BLOB based on an input filename and used group.
+
+    filename of BLOB will be '<INPUT>_<GROUP>_rmsd.blob', where
+    <INPUT> is the filename of the input without '.gro' suffix
+    and group is the group of atoms used for computing the rmsd.
+    """
+    return os.path.splitext(inputFilename)[0] + "_rmsd.blob"
+
+  def __init__(self, params):
+    self.log = logging.getLogger("g_rms")
+    self.params = params
+    self.params.setDefault( "project_dir", "." )
+    self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    self.params.setDefault( "blob_autoload", True )
+    self.RMSD = []
+    # load from BLOB (if available)
+    self.blob = self.blobFilename( self.params["input"] )
+    for filename in self.params["RMSD_BLOBS"]:
+      if ( os.path.basename(filename) == self.blob ) and self.params["blob_autoload"]:
+        self.RMSD = blobLoad( self.blob )
+        break
+    else:
+      self.run()
+  
+  def run(self):
+    # create unique tempfile for g_rms-output
+    _, temp = tempfile.mkstemp(suffix=".xvg", prefix="rmsd_", dir=".")
+    # delete the tempfile, just keep its name
+    os.unlink( temp )
+    # create unique tempfile for trjconv-output
+    _, tempRef = tempfile.mkstemp(suffix=".gro", prefix="rmsd_reduced_ref_", dir=".")
+    # delete the tempfile, just keep its name
+    os.unlink( tempRef )
+    # use trjconv to convert reference structure to reduced dataset
+    tcParams = Params()
+    tcParams.load()
+    tcParams["input"] = self.params["reference"]
+    tcParams["groupOut"] = self.params["groupRMSD"]
+    tcParams["reference"] = self.params["reference"]
+    tcParams["output"] = tempRef
+    Trjconv( tcParams ).reduceToGroup()
+
+    # prepare command and parameters for g_rms
+    cmd = "%s/g_rms -fit none -f %s -s %s -o %s" % (
+              self.params["gromacs_binaries"],
+              self.params["input"],
+              tempRef,
+              temp
+    )
+
+    ### run g_rms
+    # save original directory
+    origDir = os.getcwd()
+    # go to project dir
+    os.chdir( self.params["project_dir"] )
+    self.log.info( "running '%s' with group '%s'",
+                    cmd, self.params["groupRMSD"]
+    )
+    childProcess = pexpect.spawn( cmd )
+    # set group
+    childProcess.expect( "Select a group" )
+    childProcess.sendline( "0" )
+    # close process
+    childProcess.expect( pexpect.EOF, timeout=None )
+    childProcess.close()
+    self.log.info( "...finished 'g_rms' with group '%s'.", self.params["groupRMSD"] )
+    # go back to original directory
+    os.chdir( origDir )
+
+    ### parse .xvg file
+    def lineParser( line, outRef ):
+      line = line.strip()
+      if line == "" or line[0] == "#" or line[0] == "@":
+        return
+      else:
+        # sec. col. is RMSD
+        outRef.append( float(line.split()[1]) )
+
+    fh = open( temp, 'r' )
+    RMSD = []
+    linewise( fh, lineParser, RMSD )
+    # delete the tempfiles
+    os.unlink( temp )
+    os.unlink( tempRef )
+    
+    self.RMSD = scipy.array( RMSD )
+    if self.params["blob_autoload"]:
+      # save data
+      blobDump( self.RMSD, self.blob )
+
+    return self.RMSD
+
+
+
+
+class G_gyrate:
+  @staticmethod
+  def blobFilename( inputFilename, groupName ):
+    """
+    generate filename for a RGyr-BLOB based on an input filename and used group.
+
+    filename of BLOB will be '<INPUT>_<GROUP>_rgyr.blob', where
+    <INPUT> is the filename of the input without '.gro' suffix
+    and group is the group of atoms used for computing the radius of gyr.
+    """
+    return os.path.splitext(inputFilename)[0] + "_" + groupName + "_rgyr.blob"
+
+  def __init__(self, params):
+    # create logger
+    self.log = logging.getLogger("g_gyrate")
+    self.params = params
+    self.params.setDefault( "project_dir", "." )
+    self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    self.params.setDefault( "blob_autoload", True )
+    self.params.setDefault( "groupRgyr", "System" )
+    self.Rgyr = []
+    # load from BLOB (if available)
+    self.blob = self.blobFilename( self.params["input"], self.params["groupRgyr"] )
+    for filename in self.params["RGYR_BLOBS"]:
+      if ( os.path.basename(filename) == self.blob ) and self.params["blob_autoload"]:
+        self.Rgyr = blobLoad( self.blob )
+        break
+    else:
+      self.run()
+
+  def run(self):
+    # create unique tempfile for g_rama-output
+    _, temp = tempfile.mkstemp(suffix=".xvg", prefix="rGyr_", dir=".")
+    # delete the tempfile, just keep its name
+    os.unlink( temp )
+    # prepare command and parameters
+    cmd = "%s/g_gyrate -f %s -s %s -n %s -o %s" % (
+              self.params["gromacs_binaries"],
+              self.params["input"],
+              self.params["reference"],
+              self.params["index"], temp
+    )
+
+    ### run g_gyrate
+    # save original directory
+    origDir = os.getcwd()
+    # go to project dir
+    os.chdir( self.params["project_dir"] )
+    self.log.info( "running '%s' with group '%s'",
+                    cmd, self.params["groupRgyr"]
+    )
+    childProcess = pexpect.spawn( cmd )
+    # set group
+    childProcess.expect( "Select a group" )
+    childProcess.sendline( self.params["groupRgyr"] )
+    # close process
+    childProcess.expect( pexpect.EOF, timeout=None )
+    childProcess.close()
+    self.log.info( "...finished 'g_gyrate' with group '%s'.", self.params["groupRgyr"] )
+    # go back to original directory
+    os.chdir( origDir )
+
+    ### parse .xvg file
+    def lineParser( line, outRef ):
+      line = line.strip()
+      if line == "" or line[0] == "#" or line[0] == "@":
+        return
+      else:
+        # sec. col. is Rgyr (total)
+        outRef.append( float(line.split()[1]) )
+
+    fh = open( temp, 'r' )
+    Rgyr = []
+    linewise( fh, lineParser, Rgyr )
+    # delete the tempfile
+    os.unlink( temp )
+    
+    self.Rgyr = scipy.array( Rgyr )
+    if self.params["blob_autoload"]:
+      # save data
+      blobDump( self.Rgyr, self.blob )
+
+
+
 
 class Trjconv:
   """wrapper around the trjconv binary"""
@@ -922,6 +1128,33 @@ class Trjconv:
     self.projectDir = projectDirectory
     self.binary = pathToBinary
 
+
+  def reduceToGroup(self):
+    log = logging.getLogger("trjconv")
+    # save original directory
+    origDir = os.getcwd()
+    # go to project dir
+    os.chdir( self.projectDir )
+    # run single reference fit
+    cmd  = self.binary + " -f " +   self.params["input"]
+    cmd +=               " -o " +   self.params["output"]
+    cmd +=               " -s " +   self.params["reference"]
+    cmd +=               " -n " +   self.params["index"]
+    cmd +=               " -fit none"
+    # run binary
+    log.info( "running '%s' to reduce structure to group '%s'" % (cmd, self.params["groupOut"]))
+    childProcess = pexpect.spawn( cmd )
+    # set output gr oup
+    childProcess.expect( "Select a group" )
+    childProcess.sendline( self.params["groupOut"] )
+    # close process
+    childProcess.expect( pexpect.EOF, timeout=None )
+    childProcess.close()
+    log.info( " ... finished reduction to '%s'.", self.params["groupOut"] )
+    # go back to original directory
+    os.chdir( origDir )
+
+
   def fit(self):
     """
     run fit on trajectory
@@ -930,7 +1163,7 @@ class Trjconv:
 
       - input:     trajectory filename for input
       - output:    trajectory filename for output
-      - topology:  topology file 
+      - reference: file with reference structure
       - index:     index file
       - mode:      "rot+trans" (DEFAULT), "rotxy+transxy", "translation", "transxy" or "progressive"
       - groupFit:  name of group that should be fitted to
@@ -957,7 +1190,7 @@ class Trjconv:
     # run single reference fit
     cmd  = self.binary + " -f " +   self.params["input"]
     cmd +=               " -o " +   self.params["output"]
-    cmd +=               " -s " +   self.params["topology"]
+    cmd +=               " -s " +   self.params["reference"]
     cmd +=               " -n " +   self.params["index"]
     cmd +=               " -fit " + self.params["mode"]
     # run binary
@@ -1149,12 +1382,12 @@ class GroFile:
     finally:
       fh.close()
 
-  def read(self):
+  def read(self, nFrames=None):
     traj = Trajectory()
-    self.framewise( traj.structures.append )
+    self.framewise( traj.structures.append, nFrames )
     return traj
 
-  def write(self, traj, mode="w"):
+  def write(self, traj, fh=None, mode="w"):
     """
     write trajectory to .gro-file
 
@@ -1165,7 +1398,11 @@ class GroFile:
     """
     # TODO: currently ignores box vectors
     # TODO: currently ignores top title ( 'Protein in water' hardcoded )
-    fh = open( self.params["output"], mode )
+    if fh:
+      fileGiven = True
+    else:
+      fileGiven = False
+      fh = open( self.params["output"], mode )
     templHead   = "Generated by PGT : Protein in water t= %9.5f\n"
     templNAtoms = "%5d\n"
     templStruct = "%8s%7s%5d%8.3f%8.3f%8.3f%8.4f%8.4f%8.4f\n"
@@ -1184,7 +1421,8 @@ class GroFile:
         fh.write( templBoxVec % tuple(scipy.zeros(9)) )
         t += dt
     finally:
-      fh.close()
+      if not fileGiven:
+        fh.close()
 
 
 ######################
@@ -1193,19 +1431,21 @@ class PCA:
   """
   perform a principal component analysis on the given matrix
 
-  **mode**
+  ** parameter **
+    - PCA_proj: list with eigenvectors for eigenvector projection. None for all eigenvectors.
+            e.g.: params['proj'] = [1,2,3]  -> project data only on first three eigenvectors
 
-    perform PCA using either covariance- or correlation matrix.
-    - mode='cov':  use covariance matrix (DEFAULT)
-    - mode='corr': use correlation matrix
+    *** mode ***
+      perform PCA using either covariance- or correlation matrix.
+      - PCA_mode='cov':  use covariance matrix (DEFAULT)
+      - PCA_mode='corr': use correlation matrix
 
-  **attributes**
-
+  ** attributes **
     - projection: trajectory projected onto PCs
     - fracs:      fractions of variance for PCs
   """
   @staticmethod
-  def blobFilename( inputFilename, pcaMode ):
+  def blobFilename( params ):
     """
     generate filename for a PCA-BLOB based on an input filename and PCA mode.
 
@@ -1213,7 +1453,11 @@ class PCA:
     <INPUT> is the filename of the input without '.gro' suffix
     and mode is the PCA mode (e.g. 'cov' or 'corr').
     """
-    return os.path.splitext(inputFilename)[0] + "_" + pcaMode + "_pca.blob"
+    if params["PCA_proj"]:
+      projMode = "_proj" + "".join( map(str, params["PCA_proj"]) )
+    else:
+      projMode = ""
+    return os.path.splitext(params["input"])[0] + "_" + params["PCA_mode"] + projMode + "_pca.blob"
 
   def __init__(self, params=None, autosave=True ):
     if params:
@@ -1223,9 +1467,10 @@ class PCA:
     self.log = logging.getLogger( " PCA " )
     self.autosave = autosave
     self.params.setDefault( "PCA_mode", "cov" )
+    self.params.setDefault( "PCA_proj", None  )
     # load PCA if available
     if "input" in self.params.keys():
-      blobname = self.blobFilename( self.params["input"], self.params["PCA_mode"] )
+      blobname = self.blobFilename( self.params )
       for filename in self.params["PCA_BLOBS"]:
         if ( os.path.basename(filename) == blobname ) and self.autosave:
           self.log.info( " loading existing PCA data from: " + filename )
@@ -1234,8 +1479,7 @@ class PCA:
           break
       else:
         # compute PCA (if input file is given)
-        if "PATH" in self.params.keys():
-          #m = GroFile( self.params["PATH"] + "/" + self.params["input"] ).readCoords()
+        if "input" in self.params.keys():
           m = GroFile( self.params ).readCoords()
           self.run( m )
           del m
@@ -1264,12 +1508,25 @@ class PCA:
     _ ,s,v = numpy.linalg.svd( c )
     del c
     v = v.transpose()
-    self.projection = m*v
+
+    if self.params["PCA_proj"]:
+      nRows, nCols = v.shape
+      # set indices to base0
+      colsToKeep = map(lambda x: x-1, self.params["PCA_proj"])
+      p = m*v
+      # set columns of p not given in list to zero -> v'
+      for i in range(nCols):
+        if not (i in colsToKeep):
+          p.T[i] = scipy.zeros( p.shape[0] )
+      # project data on selected eigenvecs only
+      self.projection = p*v.T
+    else:
+      self.projection = m*v
     self.eigenvals = s
     self.eigenvecs = v
     self.log.info( " ... finished." )
-    if self.autosave and "PATH" in self.params.keys():
-      blobName = self.params["PATH"] + "/" + self.blobFilename(self.params["input"], self.params["PCA_mode"])
+    if self.autosave:
+      blobName = self.blobFilename(self.params)
       self.log.info( " saving PCA data to: " + blobName )
       blobDump( (self.projection, self.eigenvals, self.eigenvecs, self.params["PCA_mode"]),
                 blobName
@@ -1392,7 +1649,8 @@ class PCA:
       plt.xlabel( str(pcX+1) + ". PC" )
       plt.ylabel( str(pcY+1) + ". PC" )
       if mode == 'population':
-        plt.title( "combined population of %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
+        #plt.title( "combined population of %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
+        plt.title( "P($v_{%s}, v_{%s}$)" % (str(pcX+1), str(pcY+1)) )
       elif mode == 'fel':
         plt.title( "free energy landscape along %s. and %s. PC" % (str(pcX+1), str(pcY+1)) )
       else:
@@ -1463,17 +1721,22 @@ class PCA:
 
     #TODO: implement write to file
 
-  def plotConvergence(self, prep=None):
+  def calculateConvergence(self):
     normalizedEigenvals = map( lambda x: x/sum(self.eigenvals), self.eigenvals )
     acc = [ 0.0 ]
     for i in range( len(normalizedEigenvals) ):
       acc.append( sum(normalizedEigenvals[:i+1]) )
+    self.convergence = acc
+    return self.convergence
 
+  def plotConvergence(self, prep=None):
+    conv = self.calculateConvergence()
     plt.figure()
     plt.subplot(111)
-    plt.plot( range(len(acc)), acc, marker='o' )
-    plt.xticks( range(len(acc)) )
+    plt.plot( range(len(conv)), conv, marker='o' )
+    plt.xticks( range(len(conv)) )
     plt.xlabel( "index of PC" )
     plt.ylabel( "acc. percentage" )
     plt.title( "accumulated percentage of variation of PCs" )
+    plt.show()
 
