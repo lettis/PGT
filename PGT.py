@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import os
 import sys
+import platform
 import tempfile
 import logging
 import cPickle
@@ -952,7 +953,12 @@ class G_rms:
     self.log = logging.getLogger("g_rms")
     self.params = params
     self.params.setDefault( "project_dir", "." )
-    self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    if "bmd" in platform.node():
+      # assume local machine
+      self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    else:
+      # assume BWGRID
+      self.params.setDefault( "gromacs_binaries", "/opt/bwgrid/chem/gromacs/4.5.5-openmpi-1.4.3-intel-12.0/bin/" )
     self.params.setDefault( "blob_autoload", True )
     self.RMSD = []
     # load from BLOB (if available)
@@ -1052,7 +1058,12 @@ class G_gyrate:
     self.log = logging.getLogger("g_gyrate")
     self.params = params
     self.params.setDefault( "project_dir", "." )
-    self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    if "bmd" in platform.node():
+      # assume local machine
+      self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    else:
+      # assume BWGRID
+      self.params.setDefault( "gromacs_binaries", "/opt/bwgrid/chem/gromacs/4.5.5-openmpi-1.4.3-intel-12.0/bin/" )
     self.params.setDefault( "blob_autoload", True )
     self.params.setDefault( "groupRgyr", "System" )
     self.Rgyr = []
@@ -1071,7 +1082,7 @@ class G_gyrate:
     # delete the tempfile, just keep its name
     os.unlink( temp )
     # prepare command and parameters
-    cmd = "%s/g_gyrate -f %s -s %s -n %s -o %s" % (
+    cmd = "%sg_gyrate -f %s -s %s -n %s -o %s" % (
               self.params["gromacs_binaries"],
               self.params["input"],
               self.params["reference"],
