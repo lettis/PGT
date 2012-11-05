@@ -11,6 +11,7 @@ from glob import glob
 try:
   import numpy
   import scipy
+  import scipy.sparse
 except:
   print "error: numpy/scipy not found. cannot do without it. sorry."
   sys.exit()
@@ -186,7 +187,7 @@ def splitList( a, nElems ):
   return lists
 
 
-def smoothen( xs, ys, width=100 ):
+def smoothen( xs, ys=None, width=100 ):
   """
   smoothen the given data (x- and y-values; given as lists) by
   generating new lists with the averages over #'width' datapoints
@@ -195,7 +196,8 @@ def smoothen( xs, ys, width=100 ):
   newYs = []
   for i in range(width, len(xs) ):
     newXs.append( sum(xs[ i-width:i ]) / width )
-    newYs.append( sum(ys[ i-width:i ]) / width )
+    if ys:
+      newYs.append( sum(ys[ i-width:i ]) / width )
   return (newXs, newYs)
 
 
@@ -256,7 +258,8 @@ def linewise( fh, func, ref ):
 def blobDump( obj, filename ):
   """write serialized version of object to file"""
   fh = open( filename, "wb" )
-  cPickle.dump( obj, fh, cPickle.HIGHEST_PROTOCOL )
+  #cPickle.dump( obj, fh, cPickle.HIGHEST_PROTOCOL )
+  cPickle.dump( obj, fh, 1 )
   fh.close()
   log = logging.getLogger( " blobDump " )
   log.info( "dumping '%s'-object to %s" % (obj.__class__.__name__, filename) )
@@ -1129,6 +1132,171 @@ class G_gyrate:
       blobDump( self.Rgyr, self.blob )
 
 
+class G_mindist:
+
+  def __init__(self, params=Params()):
+    # create logger
+    self.log = logging.getLogger("g_mindist")
+    self.params = params
+    self.params.setDefault( "project_dir", "." )
+    self.params.setDefault( "contact_dist", 0.45 )
+    if "bmd" in platform.node():
+      # assume local machine
+      self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
+    else:
+      # assume BWGRID
+      self.params.setDefault( "gromacs_binaries", "/opt/bwgrid/chem/gromacs/4.5.5-openmpi-1.4.3-intel-12.0/bin/" )
+
+  def contactMatrices(self, groups):
+    """generate scipy array with contacts between groups given as list of groupnames"""
+    log = logging.getLogger("g_mindist")
+    nMono = len(groups)
+    cMatrices = []
+    for i in range(1,nMono):
+      for j in range(i):
+        # create unique tempfiles for g_mindist-output
+        _, tempMindist   = tempfile.mkstemp(suffix=".xvg", prefix="mindist_", dir=".")
+        _, tempNContacts = tempfile.mkstemp(suffix=".xvg", prefix="nContacts_", dir=".")
+        # delete the tempfile, just keep its name
+        os.unlink( tempMindist )
+        os.unlink( tempNContacts )
+        # create unique tempfile for g_mindist-output
+        # delete the tempfile, just keep its name
+        # prepare command and parameters
+        cmd = "%sg_mindist -f %s -s %s -n %s -od %s -on %s -d %s" % (
+                  self.params["gromacs_binaries"],
+                  self.params["trajectory"],
+                  self.params["reference"],
+                  self.params["index"],
+                  tempMindist,
+                  tempNContacts,
+                  str(self.params["contact_dist"])
+        )
+        # run binary
+        log.info( "running '%s' for groups '%s' and '%s'" % (cmd, groups[i], groups[j]))
+        childProcess = pexpect.spawn( cmd )
+        childProcess.expect( "Select a group" )
+        childProcess.sendline( groups[i] )
+        childProcess.expect( "Select a group" )
+        childProcess.sendline( groups[j] )
+        # close process
+        childProcess.expect( pexpect.EOF, timeout=None )
+        childProcess.close()
+        # parse output file and store to sparse arrays
+        contacts = []
+        try:
+          fh = open(tempNContacts, 'r')
+          for line in fh:
+            line=line.strip()
+            if line    == "":  continue
+            if line[0] == "#": continue
+            if line[0] == "@": continue
+            contacts.append( int(line.split()[1]) )
+        finally:
+          fh.close()
+        # delete tempfiles
+        os.unlink( tempMindist )
+        os.unlink( tempNContacts )
+        if i==1 and j==0:
+          # first run: setup list of matrices
+          cMatrices = map( lambda x: scipy.sparse.dok_matrix( scipy.zeros( (nMono,nMono) ) ),
+                           range(len(contacts))
+                      )
+        for k in range( len(contacts) ):
+          c = cMatrices[k]
+          # need this because of bug in scipy.sparse.dok_matrix:
+          # assigning zero to already zero field fails with exception
+          if not (c[i,j] == 0 and contacts[k] == 0):
+            c[i,j] = contacts[k]
+
+    return cMatrices
+
+
+  def aggregates(self, groups=None, cMs=None):
+    """return list with aggregates for every timestep.
+       either define 'groups' to compute contacts between defined monomers or give list
+       with a contact matrix for every timestep (cMs)."""
+    if not groups and not cMs:
+      raise Exception("need to specify either list of groups or list of contact matrices")
+    if groups:
+      # groups given: compute contact matrices
+      cMs = self.contactMatrices(groups)
+    # list of aggregates / timestep
+    aggList = []
+    nMonomers = cMs[0].shape[0]
+    for a in range( len(cMs) ):
+      aggregates = []
+      for i in range(nMonomers):
+        noneFound = True
+        for j in range(i, nMonomers):
+          if cMs[a][j,i] != 0:
+            noneFound = False
+            for k in range(len(aggregates)):
+              if i in aggregates[k]:
+                aggregates[k].append( j )
+                break
+              if j in aggregates[k]:
+                aggregates[k].append( i )
+                break
+            else:
+              aggregates.append( [i,j] )
+        if noneFound:
+          for k in range(len(aggregates)):
+            if i in aggregates[k]:
+              break
+          else:
+            aggregates.append( [i] )
+      # make indices in aggregates distinct
+      for k in range(len(aggregates)):
+        aggregates[k] = sorted( list(set(aggregates[k])) )
+      aggList.append( aggregates )
+    # return list with aggregates for every timestep
+    return aggList
+
+  def transitionMatrix(self, aggregates, nMonomers):
+    """
+    build transition matrix of polymers
+    schema: take aggregates of step i+1 and check, which aggregates of step i spent a monomer
+            for the specified agg. at i+1.
+            e.g.:     i                     i+1
+                  [ [1,2], [3,4,5] ]  ->  [ [1,2,3,4], [5] ]
+            first aggregate at i+1: [1,2,3,4] has monomers from [1,2] and [3,4,5].
+            therefore it is made up to 2/4=1/2 from a dimer and 2/4=1/2 from a trimer.
+            second aggregate is [5], made completely from a trimer ([3,4,5] in step i), giving a ratio of 1.
+            resulting matrix:
+           to   I  II  III   IV    V
+       from
+          I  [ [0,  0,  0,   0,    0],
+         II    [0,  0,  0,   0.5,  0],
+        III    [1,  0,  0,   0.5,  0],
+         IV    [0,  0,  0,   0,    0],
+          V    [0,  0,  0,   0,    0]  ]
+            read matrix as:  'to' is made up by a ratio of '#' of 'from'.
+            i.e.  "one tetramer is built 0.5 by monomers from a dimer and 0.5 by monomers from a trimer".
+    """
+    tM = scipy.zeros( (nMonomers,nMonomers) )
+    for iStep in range( len(aggregates)-1 ):
+      tMlocal = scipy.zeros( (nMonomers,nMonomers) )
+      for agg in aggregates[iStep+1]:
+        nFormer = lambda x,a: [len(a[j]) for j in range(len(a)) if x in a[j] ][0]
+        for i in agg:
+          nTo = len(agg)
+          nFrom = nFormer(i,aggregates[iStep])
+          tMlocal[nFrom-1, nTo-1] += 1.0/nTo
+      tM += tMlocal
+    return tM
+
+  def aggregateCombinations(self, aggregates, nMonomers):
+    combinations = {}
+    for agg in aggregates:
+      c = sorted( [len(agg[i]) for i in range(len(agg))] )
+      if sum(c) != nMonomers:
+        print c, agg
+      if str(c) in combinations.keys():
+        combinations[ str(c) ] += 1
+      else:
+        combinations[ str(c) ]  = 1
+    return combinations
 
 
 class Trjconv:
