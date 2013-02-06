@@ -6,6 +6,7 @@ import tempfile
 import logging
 import cPickle
 import copy
+import operator
 from glob import glob
 
 try:
@@ -27,6 +28,11 @@ try:
   import matplotlib
 except:
   print "warning: matplotlib not found. won't be able to produce plots."
+
+try:
+  import networkx as nx
+except:
+  print "warning: networkx not found. won't be able to produce networks/graphs."
 
 
 # set log-level to INFO
@@ -325,7 +331,6 @@ def angleBetweenVectors( v1, v2 ):
   return scipy.arccos( scipy.absolute(scipy.dot(v1,v2)) / normV1 / normV2 )
 
 
-#TODO: implement MR
 def rotFits( M, ref=None ):
   """
   read matrix M with cartesian 3D coordinates of N particles of form
@@ -712,8 +717,11 @@ class Dihedrals:
 
       plt.ylabel( "population" )
       plt.xlabel( "[deg]" )
+      # plot selection
+      plt.show()
 
     span = matplotlib.widgets.RectangleSelector( ax, onselect )
+    plt.show()
 
 
   def sinCosTransform(self):
@@ -1132,49 +1140,47 @@ class G_gyrate:
       blobDump( self.Rgyr, self.blob )
 
 
-class G_mindist:
-
+class PairwiseBinary:
+  """generic caller for pairwise interaction"""
   def __init__(self, params=Params()):
-    # create logger
-    self.log = logging.getLogger("g_mindist")
+    self.log = logging.getLogger("generic pairwise interaction")
     self.params = params
     self.params.setDefault( "project_dir", "." )
-    self.params.setDefault( "contact_dist", 0.45 )
     if "bmd" in platform.node():
       # assume local machine
       self.params.setDefault( "gromacs_binaries", "/usr/bin/" )
     else:
       # assume BWGRID
       self.params.setDefault( "gromacs_binaries", "/opt/bwgrid/chem/gromacs/4.5.5-openmpi-1.4.3-intel-12.0/bin/" )
+    # call localInit of child-class (if implemented)
+    self.localInit()
 
-  def contactMatrices(self, groups):
-    """generate scipy array with contacts between groups given as list of groupnames"""
-    log = logging.getLogger("g_mindist")
-    nMono = len(groups)
-    cMatrices = []
-    for i in range(1,nMono):
+  def localInit(self):
+    """implement this in child-classes to use parent-constructor with defaults"""
+    pass
+
+  def pairwiseInteraction(self, cmd, groups, cmdOpts, colDistribution=1, colRawdata=1):
+    """generate scipy array with data from pairwise interaction between groups given as list of groupnames"""
+    nGroups = len(groups)
+    rMatrices = None
+    dMatrices = None
+    for i in range(1,nGroups):
       for j in range(i):
         # create unique tempfiles for g_mindist-output
-        _, tempMindist   = tempfile.mkstemp(suffix=".xvg", prefix="mindist_", dir=".")
-        _, tempNContacts = tempfile.mkstemp(suffix=".xvg", prefix="nContacts_", dir=".")
+        _, tempRawdata      = tempfile.mkstemp(suffix=".xvg", prefix="rawdata_", dir=".")
+        _, tempDistribution = tempfile.mkstemp(suffix=".xvg", prefix="distribution_", dir=".")
         # delete the tempfile, just keep its name
-        os.unlink( tempMindist )
-        os.unlink( tempNContacts )
-        # create unique tempfile for g_mindist-output
-        # delete the tempfile, just keep its name
-        # prepare command and parameters
-        cmd = "%sg_mindist -f %s -s %s -n %s -od %s -on %s -d %s" % (
-                  self.params["gromacs_binaries"],
-                  self.params["trajectory"],
-                  self.params["reference"],
-                  self.params["index"],
-                  tempMindist,
-                  tempNContacts,
-                  str(self.params["contact_dist"])
-        )
+        os.unlink( tempRawdata      )
+        os.unlink( tempDistribution )
+        # prepare command
+        runCmd = cmd
+        if "rawdata" in cmdOpts.keys() and cmdOpts["rawdata"] != None:
+          runCmd += " " + cmdOpts["rawdata"] + " " + tempRawdata
+        if "distribution" in cmdOpts.keys() and cmdOpts["distribution"] != None:
+          runCmd += " " + cmdOpts["distribution"] + " " + tempDistribution
         # run binary
-        log.info( "running '%s' for groups '%s' and '%s'" % (cmd, groups[i], groups[j]))
-        childProcess = pexpect.spawn( cmd )
+        self.log.info( "running '%s' for groups '%s' and '%s'" % (runCmd, groups[i], groups[j]))
+        childProcess = pexpect.spawn( runCmd )
         childProcess.expect( "Select a group" )
         childProcess.sendline( groups[i] )
         childProcess.expect( "Select a group" )
@@ -1182,35 +1188,149 @@ class G_mindist:
         # close process
         childProcess.expect( pexpect.EOF, timeout=None )
         childProcess.close()
-        # parse output file and store to sparse arrays
-        contacts = []
-        try:
-          fh = open(tempNContacts, 'r')
-          for line in fh:
-            line=line.strip()
-            if line    == "":  continue
-            if line[0] == "#": continue
-            if line[0] == "@": continue
-            contacts.append( int(line.split()[1]) )
-        finally:
-          fh.close()
+        if "distribution" in cmdOpts.keys() and cmdOpts["distribution"] != None:
+          # parse output file and store to sparse arrays
+          nInteractions = []
+          try:
+            fh = open(tempDistribution, 'r')
+            for line in fh:
+              line=line.strip()
+              if line    == "":  continue
+              if line[0] == "#": continue
+              if line[0] == "@": continue
+              nInteractions.append( int(line.split()[colDistribution]) )
+          finally:
+            fh.close()
+          if i==1 and j==0:
+            # first run: setup list of matrices
+            dMatrices = map( lambda x: scipy.sparse.dok_matrix( scipy.zeros( (nGroups,nGroups) ) ),
+                             range(len(nInteractions))
+                        )
+          for k in range( len(nInteractions) ):
+            n = dMatrices[k]
+            # need this because of bug in scipy.sparse.dok_matrix:
+            # assigning zero to already zero field fails with exception
+            if not (n[i,j] == 0 and nInteractions[k] == 0):
+              n[i,j] = nInteractions[k]
+        if "rawdata" in cmdOpts.keys() and cmdOpts["rawdata"] != None:
+          rawdata = []
+          try:
+            fh = open(tempRawdata, 'r')
+            for line in fh:
+              line = line.strip()
+              if line    == "":  continue
+              if line[0] == "#": continue
+              if line[0] == "@": continue
+              rawdata.append( float(line.split()[colRawdata]) )
+          finally:
+            fh.close()
+
+          if i==1 and j==0:
+            rMatrices = map( lambda x: scipy.sparse.dok_matrix( scipy.zeros( (nGroups,nGroups) ) ),
+                             range(len(rawdata))
+                        )
+          for k in range( len(rawdata) ):
+            r = rMatrices[k]
+            # need this because of bug in scipy.sparse.dok_matrix:
+            # assigning zero to already zero field fails with exception
+            if not (r[i,j] == 0 and rawdata[k] == 0):
+              r[i,j] = rawdata[k]
+
         # delete tempfiles
-        os.unlink( tempMindist )
-        os.unlink( tempNContacts )
-        if i==1 and j==0:
-          # first run: setup list of matrices
-          cMatrices = map( lambda x: scipy.sparse.dok_matrix( scipy.zeros( (nMono,nMono) ) ),
-                           range(len(contacts))
-                      )
-        for k in range( len(contacts) ):
-          c = cMatrices[k]
-          # need this because of bug in scipy.sparse.dok_matrix:
-          # assigning zero to already zero field fails with exception
-          if not (c[i,j] == 0 and contacts[k] == 0):
-            c[i,j] = contacts[k]
+        try:
+          os.unlink( tempRawdata )
+        except OSError: pass
+        try:
+          os.unlink( tempDistribution )
+        except OSError: pass
 
-    return cMatrices
+    return (rMatrices, dMatrices) # lists of matrices with rawdata and distribution
 
+
+
+class G_sgangle(PairwiseBinary):
+
+  def localInit(self):
+    self.log = logging.getLogger("g_sgangle")
+
+  def angleMatrices(self, groups):
+    """compute list of angle matrices"""
+    # prepare command and parameters
+    cmd = "%sg_sgangle -f %s -s %s -n %s" % (
+              self.params["gromacs_binaries"],
+              self.params["trajectory"],
+              self.params["reference"],
+              self.params["index"]
+    )
+    cmdOpts = {}
+    # not interested in the raw data
+    cmdOpts["rawdata"] = "-oa"
+    # ... but in the distribution (i.e. number of contacts)
+    cmdOpts["distribution"] = None
+    return self.pairwiseInteraction(cmd, groups, cmdOpts, colRawdata=2)[0]
+
+  def angleClustering(self, aMs, angleCutoffs, cMs=None):
+    """take angle pairs from angle matrices and cluster them into
+       the intervals defined by the 'angleCutoffs'.
+       e.g.: angleCutoffs = [120,240] will sort a given angle
+       into the ranges [0,120), [120,240) and [240,180].
+       40 deg will in this example be matched to 1 (index 0 == no contact)
+       167 deg -> 2, 301 deg -> 3, etc.
+
+       returns list of matrices with cluster assignments.
+       if cMs (contact matrices) are given, check only those angles that
+       are in contact.
+    """
+    nMolecules, _ = aMs[0].shape
+    nFrames = len(aMs)
+    clusts = map( lambda x: scipy.sparse.dok_matrix( scipy.zeros( (nMolecules,nMolecules) ) ),
+                  range(nFrames)
+             )
+    for i in range(nFrames):
+      aM = aMs[i]
+      for r in range(nMolecules):
+        for c in range(r, nMolecules):
+          if (r == c) or (cMs and cMs[i][r,c] == 0 and cMs[i][c,r] == 0):
+            # use contact information + no contact for this pair: skip it!
+            continue
+          a = aMs[i][r,c]
+          if a == 0:
+            a = aMs[i][c,r]
+          for cut, cutoff in enumerate(angleCutoffs):
+            if a < cutoff:
+              clusts[i][r,c] = cut+1
+              break
+          else:
+            clusts[i][r,c] = len(angleCutoffs)+1
+    return clusts
+
+
+class G_mindist(PairwiseBinary):
+
+  def localInit(self):
+    self.log = logging.getLogger("g_mindist")
+    self.params.setDefault( "contact_dist", 0.45 )
+    
+  def contactMatrices(self, groups):
+    """compute list of contact matrices"""
+    # prepare command and parameters
+    cmd = "%sg_mindist -f %s -s %s -n %s -d %s" % (
+              self.params["gromacs_binaries"],
+              self.params["trajectory"],
+              self.params["reference"],
+              self.params["index"],
+              str(self.params["contact_dist"])
+    )
+    cmdOpts = {}
+    # not interested in the raw data
+    cmdOpts["rawdata"] = None
+    # ... but in the distribution (i.e. number of contacts)
+    cmdOpts["distribution"] = "-on"
+    # delete default mindist-file
+    try:
+      os.unlink("mindist.xvg")
+    except OSError: pass
+    return self.pairwiseInteraction(cmd, groups, cmdOpts)[1]
 
   def aggregates(self, groups=None, cMs=None):
     """return list with aggregates for every timestep.
@@ -1221,39 +1341,40 @@ class G_mindist:
     if groups:
       # groups given: compute contact matrices
       cMs = self.contactMatrices(groups)
+
+    def mergeAggs( aggs ):
+      """tests all aggregates for mergeability. if two aggregates are mergeable,
+         they will be merged (inline) and the new list of aggregates will be returned"""
+      reduceOr  = lambda l: reduce(lambda x,y: x or y, l)
+      mergeable = lambda x,y: reduceOr([ n in aggs[x] for n in aggs[y] ])
+      for i in range(len(aggs)):
+        for j in range(i+1,len(aggs)):
+          if mergeable(i,j):
+            aggs[i] = list( set(aggs[i] + aggs[j]) )
+            aggs.remove( aggs[j] )
+            break
+      return aggs
+
     # list of aggregates / timestep
     aggList = []
     nMonomers = cMs[0].shape[0]
     for a in range( len(cMs) ):
       aggregates = []
       for i in range(nMonomers):
-        noneFound = True
-        for j in range(i, nMonomers):
+        aggregates.append([i])
+        for j in range(i,nMonomers):
           if cMs[a][j,i] != 0:
-            noneFound = False
-            for k in range(len(aggregates)):
-              if i in aggregates[k]:
-                aggregates[k].append( j )
-                break
-              if j in aggregates[k]:
-                aggregates[k].append( i )
-                break
-            else:
-              aggregates.append( [i,j] )
-        if noneFound:
-          for k in range(len(aggregates)):
-            if i in aggregates[k]:
-              break
-          else:
-            aggregates.append( [i] )
-      # make indices in aggregates distinct
-      for k in range(len(aggregates)):
-        aggregates[k] = sorted( list(set(aggregates[k])) )
+            aggregates[i].append(j)
+      # merge aggregates that belong together
+      oldLength = len(aggregates)+1
+      while len(aggregates) != oldLength:
+        oldLength = len(aggregates)
+        aggregates = mergeAggs(aggregates)
       aggList.append( aggregates )
     # return list with aggregates for every timestep
     return aggList
 
-  def transitionMatrix(self, aggregates, nMonomers):
+  def transitionMatrixSummedRatios(self, aggregates, nMonomers):
     """
     build transition matrix of polymers
     schema: take aggregates of step i+1 and check, which aggregates of step i spent a monomer
@@ -1286,17 +1407,128 @@ class G_mindist:
       tM += tMlocal
     return tM
 
-  def aggregateCombinations(self, aggregates, nMonomers):
+
+  def transitionMatrixSingleMolecules(self, aggregates):
+    """
+    count every time a single molecule goes from one state (e.g. 'monomer') to
+    another state (e.g. 'trimer').
+    row-index defines from-state, col-index defines to-state.
+    """
+    a = aggregates
+    # get number of monomers
+    nMonomers = sum( [ len(g) for g in a[0] ] )
+    tm = scipy.zeros( (nMonomers, nMonomers) )
+    def whichPoly( g, i ):
+      for s in g:
+        if i in s:
+          return len(s)
+    for g in range(len(a)-1):
+      #for i in range(1,nMonomers+1):
+      for i in range(0,nMonomers):
+        # polyFrom == type of polymer the current monomer i belongs to
+        # e.g.: aggregates [ [1,2,3], [4,5] ] yield
+        #       j=3 for i=1,2 or 3  and  j=2 for i=4 or 5
+        polyFrom = whichPoly( a[g], i )
+        polyTo   = whichPoly( a[g+1], i )
+        tm[polyFrom-1][polyTo-1] += 1
+    return tm
+
+
+  def transitionMatrixCombinations(self, aggregates):
+    """
+    compute the transition matrix of the polymer combinations given by self.aggregateCombinations(...).
+    """
+    comb = self.aggregateCombinations( aggregates )
+    orderedKeys = map( lambda x: x[0],   sorted(comb.iteritems(), key=operator.itemgetter(1)) )
+    tm = scipy.zeros( (len(orderedKeys), len(orderedKeys)) )
+    for i in range( len(aggregates)-1 ):
+      keyFrom = str(sorted(aggregates[i  ]))
+      keyTo   = str(sorted(aggregates[i+1]))
+      iFrom = orderedKeys.index(keyFrom)
+      iTo   = orderedKeys.index(keyTo)
+      tm[iFrom,iTo] += 1
+    return ( orderedKeys, tm )
+
+  def aggregateCombinations(self, aggregates):
+    """
+    compute all combinations of polymers the aggregates form.
+    a trajectory with three molecules can, for example, cluster from
+    three monomers to a monomer and a dimer to a trimer.
+    with molecule-ids 0,1,2 this would give the combinations
+    [ [0], [1], [2] ],
+    [ [0,1], [2]],
+    [ [0,1,2] ],
+    with 0 & 1 forming the dimer.
+    """
     combinations = {}
-    for agg in aggregates:
-      c = sorted( [len(agg[i]) for i in range(len(agg))] )
-      if sum(c) != nMonomers:
-        print c, agg
-      if str(c) in combinations.keys():
-        combinations[ str(c) ] += 1
+    for c in aggregates:
+      c = str(sorted(c))
+      if c in combinations.keys():
+        combinations[c] += 1
       else:
-        combinations[ str(c) ]  = 1
+        combinations[c]  = 1
     return combinations
+
+
+  def normalizeTransitionMatrix(self, tm):
+    # normalize transition matrix over rows
+    nRows, _ = tm.shape
+    for i in range( nRows ):
+      tm[i] = tm[i] / tm[i].sum()
+    return tm
+
+  def labelCheck(self, nStates, labels):
+    if labels:
+      if (len(labels)) != nStates:
+        raise "# of labels does not mach # of states"
+    else:
+      labels = map(str, range(nStates))
+    return labels
+  
+  def printTransitionMatrix(self, tm, labels=None, separator=";"):
+    nStates, _ = tm.shape
+    labels = self.labelCheck(nStates, labels)
+    labels = map( lambda x: '"'+x+'"', labels )
+    buf = separator + separator.join( labels ) + "\n"
+    for i in range(nStates):
+      buf += labels[i] + separator + separator.join( map(str, tm[i]) ) + "\n"
+    print buf.strip()
+
+  def showNetwork(self, tm, labels=None, widthScale=1, toSelf=True):
+    """print graphical representation of transition matrix"""
+    nStates, _ = tm.shape
+    labels = self.labelCheck(nStates, labels)
+    g = nx.DiGraph()
+    for l in labels:
+      g.add_node(l)
+    # add edges
+    for i in range( nStates ):
+      for j in range( nStates ):
+        if (i!=j) or toSelf:
+          g.add_edge( labels[i], labels[j],  weight=tm[i,j] )
+          g.add_edge( labels[j], labels[i],  weight=tm[j,i] )
+    # define labels for plot
+    weights = []
+    edgeLabels = {}
+    for u,v in g.edges():
+      w = g.get_edge_data(u,v)['weight']
+      weights.append( w * widthScale )
+      if w >= 0.001:
+        edgeLabels[ (u,v) ] = "%0.3f" % w
+      else:
+        edgeLabels[ (u,v) ] = ""
+    # disable coordinate system in matplotlib
+    ax = plt.axes(frameon=False)
+    ax.axes.get_yaxis().set_visible(False)
+    ax.axes.get_xaxis().set_visible(False)
+    # apply layout and plot
+    #pos = nx.spring_layout(g, iterations=20)
+    pos = nx.circular_layout(g)
+    nx.draw_networkx_edges(g,pos,width=weights)
+    nx.draw_networkx_nodes(g,pos)
+    nx.draw_networkx_labels(g,pos)
+    nx.draw_networkx_edge_labels(g,pos,edge_labels=edgeLabels)
+    plt.show()
 
 
 class Trjconv:
@@ -1788,7 +2020,7 @@ class PCA:
     span = matplotlib.widgets.SpanSelector( ax, onselect )
 
 
-  def plot2DHist(self, pcX, pcY, bins=200, prep=None, mode='population'):
+  def plot2DHist(self, pcX, pcY, bins=200, prep=None, mode='population', angles=None):
     """
     plot 2d-histogram of projections of one PC over the other
 
@@ -1810,6 +2042,10 @@ class PCA:
     transp = self.projection.transpose()
     pc1 = numpy.array( transp[pcX] ).flatten()
     pc2 = numpy.array( transp[pcY] ).flatten()
+
+    if angles:
+      pc1, pc2 = self.filterAngles(pc1, pc2, angles)
+
 
     def replot( first=True ):
       fig = plt.figure()
@@ -1895,10 +2131,54 @@ class PCA:
                   color=plt.get_cmap(colormap)( float(2*i+1)/(2*(len(self.params["plot_dihedrals"]))) )
         )
         plt.legend(bbox_to_anchor=(1.02, 1), loc=2, borderaxespad=0., prop=fontP)
+      # plot the selected area
+      plt.show()
 
     span = matplotlib.widgets.RectangleSelector( ax, onselect )
+    plt.show()
 
-    #TODO: implement write to file
+
+  def filterAngles(self, pc1, pc2, angles):
+    pc1 = pc1.tolist()
+    pc2 = pc2.tolist()
+
+    # load dihedrals
+    dih = Dihedrals(self.params)
+    angleFromToFilters = []
+    for res in angles.keys():
+      if (res[:3] == "phi") or (res[:3] == "psi"):
+        n = int(res[3:])
+        resName = res[:3]
+        if resName == "phi":
+          # -2 = -1 -1,  since phi2/psi2 are first groups (-1) AND lists in python start with index 0 (-1)
+          n = 2*(n-2)
+        elif resName == "psi":
+          n = 2*(n-2) + 1
+        else:
+          raise "UnknownDihedralDefinition"
+
+        angleFromToFilters.append( (n, angles[res][0], angles[res][1]) )
+
+    def dihedralsInRange( rangeTuple, d ):
+      n, aBottom, aTop = rangeTuple
+      if (aBottom <= d[0,n]) and (d[0,n] <= aTop):
+        return True
+      else:
+        return False
+
+    for i in range( len(dih.dihedrals)-1, 0, -1 ):
+      # if dihedral(s) not in given range(s): dismiss pc-data with same index
+      d = dih.dihedrals[i]
+      for t in angleFromToFilters:
+        if not dihedralsInRange( t, d ):
+          del pc1[i]
+          del pc2[i]
+          break
+
+    return (scipy.array(pc1), scipy.array(pc2))
+
+
+
 
   def calculateConvergence(self):
     normalizedEigenvals = map( lambda x: x/sum(self.eigenvals), self.eigenvals )
